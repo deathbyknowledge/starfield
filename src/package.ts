@@ -1,4 +1,4 @@
-import { definePackage } from "@gsv/package/manifest";
+import { definePackage } from "@humansandmachines/gsv/sdk";
 
 export default definePackage({
   meta: {

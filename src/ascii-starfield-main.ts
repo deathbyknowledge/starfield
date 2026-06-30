@@ -184,51 +184,8 @@ type WorkerSnapshotMessage = {
   hud: HudSnapshot
 }
 
-type HostBridgeStatus = {
-  state: 'disconnected' | 'connecting' | 'connected'
-  url: string | null
-  username: string | null
-  connectionId: string | null
-  message: string | null
-}
-
-type ProcSpawnArgs = {
-  profile: 'init' | 'task' | 'cron' | 'mcp' | 'app'
-  label?: string
-  prompt?: string
-  parentPid?: string
-  workspace?: {
-    mode: 'none' | 'new' | 'inherit' | 'attach'
-    label?: string
-    kind?: 'thread' | 'app' | 'shared'
-    workspaceId?: string
-  }
-}
-
-type ProcSpawnResult =
-  | {
-      ok: true
-      pid: string
-      label?: string
-      profile: 'init' | 'task' | 'cron' | 'mcp' | 'app'
-      workspaceId: string | null
-      cwd: string
-    }
-  | { ok: false, error: string }
-
-type ProcSendResult =
-  | { ok: true, status: 'started', runId: string, queued?: boolean }
-  | { ok: false, error: string }
-
-type HostBridgeClient = {
-  getStatus: () => HostBridgeStatus
-  isConnected: () => boolean
-  onSignal: (listener: (signal: string, payload: unknown) => void) => () => void
-  onStatus: (listener: (status: HostBridgeStatus) => void) => () => void
-  call: <T = unknown>(call: string, args?: unknown) => Promise<T>
-  spawnProcess: (args: ProcSpawnArgs) => Promise<ProcSpawnResult>
-  sendMessage: (message: string, pid?: string) => Promise<ProcSendResult>
-}
+import { getGsvClient, hasAppBoot } from "@humansandmachines/gsv/sdk"
+import type { PackageGsvClient } from "@humansandmachines/gsv/sdk"
 
 function mountStarfieldShell(): void {
   document.title = 'ASCII Starfield'
@@ -277,7 +234,8 @@ const simulationDateLongFormatter = new Intl.DateTimeFormat(undefined, {
 })
 const prefersTouchControls = window.matchMedia('(hover: none), (pointer: coarse)').matches
 const hudObstacleElements = Array.from(document.querySelectorAll<HTMLElement>('.readout, .minimap-shell'))
-const HOST_BRIDGE_TIMEOUT_MS = 20_000
+const POLL_INTERVAL_MS = 800
+const POLL_MAX_ATTEMPTS = 120
 
 speedometer.textContent = '0.0u/s'
 simDate.textContent = '...'
@@ -303,7 +261,7 @@ let activeBrief: HudBriefContext | null = null
 let suggestionTimer: number | null = null
 let nextAnswerWindowId = 1
 const answerWindows: AnswerWindowRecord[] = []
-let hostClient: HostBridgeClient | null = null
+let gsvClient: PackageGsvClient | null = null
 const touchState = {
   moveX: 0,
   moveY: 0,
@@ -355,138 +313,6 @@ function getRequiredForm(id: string): HTMLFormElement {
   const element = document.getElementById(id)
   if (!(element instanceof HTMLFormElement)) throw new Error(`#${id} not found`)
   return element
-}
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-  if (!value || typeof value !== 'object') return null
-  return value as Record<string, unknown>
-}
-
-function asString(value: unknown): string | null {
-  return typeof value === 'string' ? value : null
-}
-
-function makeId(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID()
-  }
-  return `host-${Date.now()}-${Math.random().toString(16).slice(2)}`
-}
-
-function connectHostClient(timeoutMs = HOST_BRIDGE_TIMEOUT_MS): Promise<HostBridgeClient | null> {
-  if (!window.parent || window.parent === window) {
-    return Promise.resolve(null)
-  }
-
-  return new Promise((resolve, reject) => {
-    const timerId = window.setTimeout(() => {
-      cleanup()
-      reject(new Error('Timed out waiting for HOST bridge'))
-    }, timeoutMs)
-
-    const cleanup = (): void => {
-      window.clearTimeout(timerId)
-      window.removeEventListener('message', onMessage)
-    }
-
-    const onMessage = (event: MessageEvent<unknown>): void => {
-      if (event.origin !== window.location.origin) return
-      const record = asRecord(event.data)
-      if (!record || record.type !== 'gsv-host-connect') return
-      const port = event.ports[0]
-      if (!(port instanceof MessagePort)) {
-        cleanup()
-        reject(new Error('HOST bridge did not provide a message port'))
-        return
-      }
-      cleanup()
-      resolve(createEmbeddedHostClient(port))
-    }
-
-    window.addEventListener('message', onMessage)
-  })
-}
-
-function createEmbeddedHostClient(port: MessagePort): HostBridgeClient {
-  let status: HostBridgeStatus = {
-    state: 'connecting',
-    url: window.location.origin,
-    username: null,
-    connectionId: null,
-    message: 'Waiting for host bridge...',
-  }
-  const statusListeners = new Set<(status: HostBridgeStatus) => void>()
-  const signalListeners = new Set<(signal: string, payload: unknown) => void>()
-  const pending = new Map<string, {
-    resolve: (value: unknown) => void
-    reject: (error: Error) => void
-    timeoutId: number
-  }>()
-
-  const emitStatus = (): void => {
-    for (const listener of statusListeners) listener(status)
-  }
-
-  port.onmessage = event => {
-    const record = asRecord(event.data)
-    if (!record || typeof record.type !== 'string') return
-
-    if (record.type === 'status') {
-      status = (record.status as HostBridgeStatus | undefined) ?? status
-      emitStatus()
-      return
-    }
-
-    if (record.type === 'signal') {
-      const signal = asString(record.signal)
-      if (!signal) return
-      for (const listener of signalListeners) listener(signal, record.payload)
-      return
-    }
-
-    if (record.type !== 'rpc-result') return
-    const id = asString(record.id)
-    if (!id) return
-    const pendingRequest = pending.get(id)
-    if (!pendingRequest) return
-    pending.delete(id)
-    window.clearTimeout(pendingRequest.timeoutId)
-    if (record.ok === true) {
-      pendingRequest.resolve(record.data)
-      return
-    }
-    pendingRequest.reject(new Error(asString(record.error) ?? 'HOST request failed'))
-  }
-  port.start()
-
-  const rpc = <T>(method: string, payload?: unknown): Promise<T> => {
-    const id = makeId()
-    return new Promise((resolve, reject) => {
-      const timeoutId = window.setTimeout(() => {
-        pending.delete(id)
-        reject(new Error(`HOST request timed out: ${method}`))
-      }, HOST_BRIDGE_TIMEOUT_MS)
-      pending.set(id, { resolve, reject, timeoutId })
-      port.postMessage({ type: 'rpc', id, method, payload })
-    })
-  }
-
-  return {
-    getStatus: () => status,
-    isConnected: () => status.state === 'connected',
-    onSignal: listener => {
-      signalListeners.add(listener)
-      return () => signalListeners.delete(listener)
-    },
-    onStatus: listener => {
-      statusListeners.add(listener)
-      listener(status)
-      return () => statusListeners.delete(listener)
-    },
-    call: (call, args) => rpc('call', { call, args: args ?? {} }),
-    spawnProcess: args => rpc('spawnProcess', args),
-    sendMessage: (message, pid) => rpc('sendMessage', { message, pid }),
-  }
 }
 
 function getViewport(): WorkerViewport {
@@ -590,21 +416,13 @@ function clearAnswerWindowTimer(windowRecord: AnswerWindowRecord): void {
   windowRecord.timerId = null
 }
 
-function findAnswerWindowByPid(pid: string): AnswerWindowRecord | null {
-  return answerWindows.find(windowRecord => windowRecord.pid === pid) ?? null
-}
-
-function findAnswerWindowByRunId(runId: string): AnswerWindowRecord | null {
-  return answerWindows.find(windowRecord => windowRecord.runId === runId) ?? null
-}
-
 async function stopAnswerProcess(windowRecord: AnswerWindowRecord): Promise<void> {
   const pid = windowRecord.pid
   windowRecord.pid = null
   windowRecord.runId = null
-  if (!pid || hostClient === null || !hostClient.isConnected()) return
+  if (!pid || gsvClient === null) return
   try {
-    await hostClient.call('proc.kill', { pid, archive: false })
+    await gsvClient.proc.kill({ pid, archive: false })
   } catch {}
 }
 
@@ -1134,8 +952,74 @@ function buildGuidePrompt(question: string, brief: HudBriefContext): string {
   ].join('\n')
 }
 
+function extractAssistantText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return content
+    .filter((block): block is { type: 'text', text: string } =>
+      typeof block === 'object' && block !== null && (block as { type?: string }).type === 'text')
+    .map(block => block.text ?? '')
+    .join('')
+    .trim()
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => window.setTimeout(resolve, ms))
+}
+
+async function pollAnswerProcess(windowRecord: AnswerWindowRecord): Promise<void> {
+  const pid = windowRecord.pid
+  if (!pid) return
+
+  let lastText = ''
+  let attempts = 0
+
+  while (windowRecord.pid === pid) {
+    await sleep(POLL_INTERVAL_MS)
+    if (windowRecord.pid !== pid) return
+
+    attempts++
+    if (attempts > POLL_MAX_ATTEMPTS) {
+      if (!windowRecord.receivedText) {
+        windowRecord.answer.textContent = 'Guide process timed out.'
+      }
+      break
+    }
+
+    try {
+      const result = await gsvClient!.proc.history({ pid, tail: true, limit: 10 })
+      if (!result.ok) break
+
+      const assistantMessages = result.messages.filter(m => m.role === 'assistant')
+      const lastAssistant = assistantMessages[assistantMessages.length - 1]
+      if (lastAssistant) {
+        const text = extractAssistantText(lastAssistant.content)
+        if (text && text.length > lastText.length) {
+          lastText = text
+          if (!windowRecord.receivedText) {
+            windowRecord.answer.textContent = ''
+            windowRecord.receivedText = true
+          }
+          windowRecord.answer.textContent = text
+        }
+      }
+
+      if (!result.activeRunId && lastAssistant) {
+        if (!windowRecord.receivedText) {
+          windowRecord.answer.textContent = 'No answer returned.'
+        }
+        break
+      }
+    } catch {
+      break
+    }
+  }
+
+  await stopAnswerProcess(windowRecord)
+}
+
 async function requestLiveAnswer(windowRecord: AnswerWindowRecord, question: string, brief: HudBriefContext): Promise<void> {
-  if (hostClient === null || !hostClient.isConnected()) {
+  if (gsvClient === null) {
     streamAnswerWindow(windowRecord, buildMockAnswer(question, brief))
     return
   }
@@ -1144,23 +1028,25 @@ async function requestLiveAnswer(windowRecord: AnswerWindowRecord, question: str
   windowRecord.receivedText = false
 
   try {
-    const spawnResult = await hostClient.spawnProcess({
-      profile: 'app',
+    const spawnResult = await gsvClient.proc.spawn({
       label: `${getBodyDisplayName(brief.name)} guide`,
-      workspace: { mode: 'none' },
     })
     if (!spawnResult.ok) {
-      throw new Error('error' in spawnResult ? spawnResult.error : 'process spawn failed')
+      throw new Error(spawnResult.error)
     }
 
     windowRecord.pid = spawnResult.pid
 
-    const sendResult = await hostClient.sendMessage(buildGuidePrompt(question, brief), spawnResult.pid)
+    const sendResult = await gsvClient.proc.send({
+      pid: spawnResult.pid,
+      message: buildGuidePrompt(question, brief),
+    })
     if (!sendResult.ok) {
-      throw new Error('error' in sendResult ? sendResult.error : 'message send failed')
+      throw new Error(sendResult.error)
     }
 
     windowRecord.runId = sendResult.runId
+    void pollAnswerProcess(windowRecord)
   } catch (error) {
     windowRecord.answer.textContent = `Live guide unavailable: ${error instanceof Error ? error.message : String(error)}`
     await stopAnswerProcess(windowRecord)
@@ -1520,45 +1406,8 @@ async function main(): Promise<void> {
   syncViewportCssVariables()
   setFlightStarted(false)
   bindEvents()
-  hostClient = await connectHostClient().catch(() => null)
-  if (hostClient !== null) {
-    hostClient.onSignal((signal, payload) => {
-      const record = asRecord(payload)
-      const pid = asString(record?.pid)
-      const runId = asString(record?.runId)
-      const windowRecord = (runId ? findAnswerWindowByRunId(runId) : null) ?? (pid ? findAnswerWindowByPid(pid) : null)
-      if (windowRecord === null) return
-
-      if (signal === 'chat.text') {
-        const text = asString(record?.text) ?? ''
-        if (text.length === 0) return
-        clearAnswerWindowTimer(windowRecord)
-        if (!windowRecord.receivedText) {
-          windowRecord.answer.textContent = ''
-          windowRecord.receivedText = true
-        }
-        windowRecord.answer.textContent += text
-        return
-      }
-
-      if (signal === 'chat.complete') {
-        const text = asString(record?.text)
-        if (text && (!windowRecord.receivedText || text.length >= windowRecord.answer.textContent.length)) {
-          clearAnswerWindowTimer(windowRecord)
-          windowRecord.answer.textContent = text
-          windowRecord.receivedText = true
-        } else if (!windowRecord.receivedText) {
-          windowRecord.answer.textContent = 'No answer returned.'
-        }
-        void stopAnswerProcess(windowRecord)
-        return
-      }
-
-      if (signal === 'process.exit' && !windowRecord.receivedText) {
-        windowRecord.answer.textContent = 'Guide process exited before returning an answer.'
-        void stopAnswerProcess(windowRecord)
-      }
-    })
+  if (hasAppBoot()) {
+    gsvClient = getGsvClient()
   }
   await document.fonts.ready
 

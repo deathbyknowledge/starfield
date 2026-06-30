@@ -4,7 +4,6 @@
   "type": "module",
   "dependencies": {
     "@chenglou/pretext": "0.0.4",
-    "capnweb": "^0.6.1",
-    "@humansandmachines/gsv": "0.0.4"
+    "@humansandmachines/gsv": "^0.0.5"
   }
 }

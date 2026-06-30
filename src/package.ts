@@ -11,6 +11,9 @@ export default definePackage({
       minWidth: 720,
       minHeight: 480,
     },
+    capabilities: {
+      kernel: ["proc.spawn", "proc.send", "proc.kill", "proc.history"],
+    },
   },
   browser: {
     entry: "./src/ascii-starfield-main.ts",

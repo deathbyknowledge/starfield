@@ -184,8 +184,20 @@ type WorkerSnapshotMessage = {
   hud: HudSnapshot
 }
 
+type WorkerReadyMessage = {
+  type: 'ready'
+}
+
+type WorkerOutboundMessage = WorkerReadyMessage | WorkerSnapshotMessage
+
+type RuntimeController = {
+  transferCanvas: boolean
+  postMessage(message: WorkerMessage, transfer?: Transferable[]): void
+}
+
 import { getGsvClient, hasAppBoot } from "@humansandmachines/gsv/sdk"
 import type { PackageGsvClient } from "@humansandmachines/gsv/sdk"
+import type { StarfieldRuntime } from "./ascii-starfield"
 
 function mountStarfieldShell(): void {
   document.title = 'ASCII Starfield'
@@ -236,6 +248,7 @@ const prefersTouchControls = window.matchMedia('(hover: none), (pointer: coarse)
 const hudObstacleElements = Array.from(document.querySelectorAll<HTMLElement>('.readout, .minimap-shell'))
 const POLL_INTERVAL_MS = 800
 const POLL_MAX_ATTEMPTS = 120
+const WORKER_READY_TIMEOUT_MS = 1200
 
 speedometer.textContent = '0.0u/s'
 simDate.textContent = '...'
@@ -247,22 +260,112 @@ if (typeof canvas.transferControlToOffscreen !== 'function') {
   throw new Error('OffscreenCanvas transfer is required for this demo')
 }
 
-function createPackageModuleWorker(moduleUrl: URL): Worker {
+function isOpaqueOrigin(): boolean {
+  return globalThis.origin === 'null'
+}
+
+function canUsePointerLock(): boolean {
+  if (hasAppBoot()) return false
+  const featurePolicy = document.featurePolicy as { allowsFeature?(feature: string): boolean } | undefined
+  if (featurePolicy?.allowsFeature?.('pointer-lock') === false) return false
+  return !isOpaqueOrigin() && typeof canvas.requestPointerLock === 'function'
+}
+
+function shouldUseInlineRuntime(): boolean {
+  return hasAppBoot() || isOpaqueOrigin()
+}
+
+function createPackageModuleWorker(moduleUrl: URL): { worker: Worker, workerBlobUrl: string } {
   const workerSource = `import ${JSON.stringify(moduleUrl.href)};\n`
   const workerBlobUrl = URL.createObjectURL(new Blob([workerSource], { type: 'text/javascript' }))
   try {
-    const packageWorker = new Worker(workerBlobUrl, { type: 'module' })
-    window.addEventListener('pagehide', () => URL.revokeObjectURL(workerBlobUrl), { once: true })
-    return packageWorker
+    return {
+      worker: new Worker(workerBlobUrl, { type: 'module' }),
+      workerBlobUrl,
+    }
   } catch (error) {
     URL.revokeObjectURL(workerBlobUrl)
     throw error
   }
 }
 
-const worker = createPackageModuleWorker(new URL('./ascii-starfield.ts', import.meta.url))
-const offscreenCanvas = canvas.transferControlToOffscreen()
-const offscreenMinimap = minimap.transferControlToOffscreen()
+function createWorkerRuntimeController(moduleUrl: URL): Promise<RuntimeController> {
+  const { worker, workerBlobUrl } = createPackageModuleWorker(moduleUrl)
+
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const timeout = window.setTimeout(() => {
+      fail(new Error('Starfield worker did not become ready.'))
+    }, WORKER_READY_TIMEOUT_MS)
+
+    const cleanup = (): void => {
+      window.clearTimeout(timeout)
+      worker.removeEventListener('error', onError)
+    }
+
+    const fail = (error: unknown): void => {
+      if (settled) return
+      settled = true
+      cleanup()
+      worker.terminate()
+      URL.revokeObjectURL(workerBlobUrl)
+      reject(error)
+    }
+
+    const onError = (event: ErrorEvent): void => {
+      fail(event.error ?? new Error(event.message || 'Starfield worker failed to load.'))
+    }
+
+    worker.addEventListener('message', event => {
+      const message = event.data as WorkerOutboundMessage
+      if (!settled) {
+        if (message.type !== 'ready') return
+        settled = true
+        cleanup()
+        window.addEventListener('pagehide', () => {
+          worker.terminate()
+          URL.revokeObjectURL(workerBlobUrl)
+        }, { once: true })
+        resolve({
+          transferCanvas: true,
+          postMessage(runtimeMessage, transfer) {
+            if (transfer) {
+              worker.postMessage(runtimeMessage, transfer)
+            } else {
+              worker.postMessage(runtimeMessage)
+            }
+          },
+        })
+        return
+      }
+      handleRuntimeMessage(message)
+    })
+
+    worker.addEventListener('error', onError)
+  })
+}
+
+async function createInlineRuntimeController(): Promise<RuntimeController> {
+  const { createStarfieldRuntime } = await import('./ascii-starfield.ts')
+  const inlineRuntime: StarfieldRuntime = createStarfieldRuntime(handleRuntimeMessage)
+  return {
+    transferCanvas: false,
+    postMessage(message) {
+      inlineRuntime.postMessage(message)
+    },
+  }
+}
+
+async function createRuntimeController(): Promise<RuntimeController> {
+  if (!shouldUseInlineRuntime()) {
+    try {
+      return await createWorkerRuntimeController(new URL('./ascii-starfield.ts', import.meta.url))
+    } catch (error) {
+      console.warn('[starfield] falling back to inline renderer', error)
+    }
+  }
+  return createInlineRuntimeController()
+}
 
 let initialized = false
 let framePending = false
@@ -275,6 +378,7 @@ let suggestionTimer: number | null = null
 let nextAnswerWindowId = 1
 const answerWindows: AnswerWindowRecord[] = []
 let gsvClient: PackageGsvClient | null = null
+let runtime: RuntimeController | null = null
 const touchState = {
   moveX: 0,
   moveY: 0,
@@ -285,6 +389,9 @@ const touchState = {
 }
 let touchLiftUpPressed = false
 let touchLiftDownPressed = false
+let dragLookPointerId: number | null = null
+let dragLookLastX = 0
+let dragLookLastY = 0
 
 function getRequiredCanvas(id: string): HTMLCanvasElement {
   const element = document.getElementById(id)
@@ -357,7 +464,7 @@ function postResizeAfterLayout(): void {
 }
 
 function postWorkerMessage(message: WorkerMessage): void {
-  worker.postMessage(message)
+  runtime?.postMessage(message)
 }
 
 function postTouchControls(): void {
@@ -1251,6 +1358,10 @@ async function beginFlight(): Promise<void> {
   }, 260)
 
   if (prefersTouchControls || document.pointerLockElement === canvas) return
+  if (!canUsePointerLock()) {
+    postWorkerMessage({ type: 'pointer-lock-notice', text: 'drag to look', durationMs: 1800 })
+    return
+  }
   try {
     await canvas.requestPointerLock()
   } catch {
@@ -1271,6 +1382,7 @@ function bindEvents(): void {
     if (!flightStarted) return
     if (prefersTouchControls) return
     if (document.pointerLockElement === canvas) return
+    if (!canUsePointerLock()) return
     try {
       await canvas.requestPointerLock()
     } catch {
@@ -1287,6 +1399,38 @@ function bindEvents(): void {
     postWorkerMessage({ type: 'pointer-move', movementX: event.movementX, movementY: event.movementY })
   })
 
+  canvas.addEventListener('pointerdown', event => {
+    if (!flightStarted || prefersTouchControls || canUsePointerLock()) return
+    event.preventDefault()
+    dragLookPointerId = event.pointerId
+    dragLookLastX = event.clientX
+    dragLookLastY = event.clientY
+    canvas.setPointerCapture(event.pointerId)
+  })
+
+  canvas.addEventListener('pointermove', event => {
+    if (dragLookPointerId !== event.pointerId) return
+    event.preventDefault()
+    const movementX = event.movementX || event.clientX - dragLookLastX
+    const movementY = event.movementY || event.clientY - dragLookLastY
+    dragLookLastX = event.clientX
+    dragLookLastY = event.clientY
+    if (movementX !== 0 || movementY !== 0) {
+      postWorkerMessage({ type: 'pointer-move', movementX, movementY })
+    }
+  })
+
+  const stopDragLook = (event: PointerEvent): void => {
+    if (dragLookPointerId !== event.pointerId) return
+    event.preventDefault()
+    dragLookPointerId = null
+    if (canvas.hasPointerCapture(event.pointerId)) {
+      canvas.releasePointerCapture(event.pointerId)
+    }
+  }
+  canvas.addEventListener('pointerup', stopDragLook)
+  canvas.addEventListener('pointercancel', stopDragLook)
+
   window.addEventListener('keydown', event => {
     if (!flightStarted) return
     if (isTextEntryTarget(event.target) || isAskPanelFocused()) return
@@ -1301,6 +1445,7 @@ function bindEvents(): void {
   })
 
   window.addEventListener('blur', () => {
+    dragLookPointerId = null
     postWorkerMessage({ type: 'clear-keys' })
     clearTouchControls()
   })
@@ -1401,8 +1546,7 @@ function bindEvents(): void {
   })
 }
 
-worker.addEventListener('message', event => {
-  const message = event.data as WorkerSnapshotMessage
+function handleRuntimeMessage(message: WorkerOutboundMessage): void {
   if (message.type !== 'snapshot') return
   framePending = false
   const now = performance.now()
@@ -1413,9 +1557,10 @@ worker.addEventListener('message', event => {
   }
   lastSnapshotAt = now
   updateHud(message.hud)
-})
+}
 
 async function main(): Promise<void> {
+  runtime = await createRuntimeController()
   syncViewportCssVariables()
   setFlightStarted(false)
   bindEvents()
@@ -1424,14 +1569,17 @@ async function main(): Promise<void> {
   }
   await document.fonts.ready
 
-  worker.postMessage(
+  const offscreenCanvas = canvas.transferControlToOffscreen()
+  const offscreenMinimap = minimap.transferControlToOffscreen()
+  const transfer = runtime.transferCanvas ? [offscreenCanvas, offscreenMinimap] : undefined
+  runtime.postMessage(
     {
       type: 'init',
       canvas: offscreenCanvas,
       minimap: offscreenMinimap,
       viewport: getViewport(),
     } satisfies WorkerInitMessage,
-    [offscreenCanvas, offscreenMinimap],
+    transfer,
   )
 
   initialized = true

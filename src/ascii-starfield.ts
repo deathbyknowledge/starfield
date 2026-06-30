@@ -384,12 +384,22 @@ type WorkerOutboundMessage = {
   hud: HudSnapshot
 }
 
-type WorkerScope = {
-  addEventListener(type: 'message', listener: (event: MessageEvent<WorkerInboundMessage>) => void): void
-  postMessage(message: WorkerOutboundMessage): void
+type WorkerReadyMessage = {
+  type: 'ready'
 }
 
-const workerScope = self as unknown as WorkerScope
+export type StarfieldRuntimeOutboundMessage = WorkerReadyMessage | WorkerOutboundMessage
+
+export type StarfieldRuntime = {
+  postMessage(message: WorkerInboundMessage): void
+}
+
+type WorkerScope = {
+  addEventListener(type: 'message', listener: (event: MessageEvent<WorkerInboundMessage>) => void): void
+  postMessage(message: StarfieldRuntimeOutboundMessage): void
+}
+
+let runtimePostMessage: ((message: StarfieldRuntimeOutboundMessage) => void) | null = null
 let mainCanvas: OffscreenCanvas | null = null
 let minimapCanvas: OffscreenCanvas | null = null
 let ctx!: OffscreenCanvasRenderingContext2D
@@ -1801,7 +1811,7 @@ function updateHud(): void {
       ? null
       : celestialBodies.find(body => body.id === state.briefOpenBodyId) ?? null
 
-  workerScope.postMessage({
+  runtimePostMessage?.({
     type: 'snapshot',
     hud: {
       speed: getCurrentSpeed(),
@@ -3574,7 +3584,7 @@ function applyCameraInput(dt: number): void {
 }
 
 function applyPointerLook(movementX: number, movementY: number): void {
-  if (!state.pointerLocked) return
+  if (!state.flightStarted) return
   state.camera.yaw += movementX * LOOK_SENSITIVITY
   state.camera.pitch = clamp(state.camera.pitch - movementY * LOOK_SENSITIVITY, -1.45, 1.45)
 }
@@ -3640,9 +3650,7 @@ function initializeWorkerRuntime(message: WorkerInitMessage): void {
   updateHud()
 }
 
-workerScope.addEventListener('message', (event: MessageEvent<WorkerInboundMessage>) => {
-  const message = event.data
-
+function handleRuntimeMessage(message: WorkerInboundMessage): void {
   switch (message.type) {
     case 'init':
       initializeWorkerRuntime(message)
@@ -3713,4 +3721,20 @@ workerScope.addEventListener('message', (event: MessageEvent<WorkerInboundMessag
       updateHud()
       return
   }
-})
+}
+
+export function createStarfieldRuntime(postMessage: (message: StarfieldRuntimeOutboundMessage) => void): StarfieldRuntime {
+  runtimePostMessage = postMessage
+  return {
+    postMessage: handleRuntimeMessage,
+  }
+}
+
+if (typeof window === 'undefined') {
+  const workerScope = self as unknown as WorkerScope
+  const runtime = createStarfieldRuntime(message => workerScope.postMessage(message))
+  workerScope.postMessage({ type: 'ready' })
+  workerScope.addEventListener('message', event => {
+    runtime.postMessage(event.data)
+  })
+}

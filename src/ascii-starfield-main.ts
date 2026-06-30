@@ -247,7 +247,20 @@ if (typeof canvas.transferControlToOffscreen !== 'function') {
   throw new Error('OffscreenCanvas transfer is required for this demo')
 }
 
-const worker = new Worker(new URL('./ascii-starfield.ts', import.meta.url), { type: 'module' })
+function createPackageModuleWorker(moduleUrl: URL): Worker {
+  const workerSource = `import ${JSON.stringify(moduleUrl.href)};\n`
+  const workerBlobUrl = URL.createObjectURL(new Blob([workerSource], { type: 'text/javascript' }))
+  try {
+    const packageWorker = new Worker(workerBlobUrl, { type: 'module' })
+    window.addEventListener('pagehide', () => URL.revokeObjectURL(workerBlobUrl), { once: true })
+    return packageWorker
+  } catch (error) {
+    URL.revokeObjectURL(workerBlobUrl)
+    throw error
+  }
+}
+
+const worker = createPackageModuleWorker(new URL('./ascii-starfield.ts', import.meta.url))
 const offscreenCanvas = canvas.transferControlToOffscreen()
 const offscreenMinimap = minimap.transferControlToOffscreen()
 
